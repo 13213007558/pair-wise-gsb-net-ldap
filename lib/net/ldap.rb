@@ -25,6 +25,7 @@ require_relative 'ldap/password'
 require_relative 'ldap/entry'
 require_relative 'ldap/instrumentation'
 require_relative 'ldap/connection'
+require_relative 'ldap/vlv'
 require_relative 'ldap/version'
 require_relative 'ldap/error'
 require_relative 'ldap/auth_adapter'
@@ -375,6 +376,8 @@ class Net::LDAP
   ResultCodeBusy                         = 51
   ResultCodeUnavailable                  = 52
   ResultCodeUnwillingToPerform           = 53
+  ResultCodeSortControlMissing           = 60
+  ResultCodeOffsetRangeError             = 61
   ResultCodeNamingViolation              = 64
   ResultCodeObjectClassViolation         = 65
   ResultCodeNotAllowedOnNonLeaf          = 66
@@ -432,6 +435,8 @@ class Net::LDAP
     ResultCodeBusy                         => "Busy",
     ResultCodeUnavailable                  => "Unavailable",
     ResultCodeUnwillingToPerform           => "Unwilling to perform",
+    ResultCodeSortControlMissing           => "Sort Control Missing",
+    ResultCodeOffsetRangeError             => "Offset Range Error",
     ResultCodeNamingViolation              => "Naming Violation",
     ResultCodeObjectClassViolation         => "Object Class Violation",
     ResultCodeNotAllowedOnNonLeaf          => "Not Allowed On Non-Leaf",
@@ -446,6 +451,8 @@ class Net::LDAP
     PAGED_RESULTS = "1.2.840.113556.1.4.319" # Microsoft evil from RFC 2696
     SORT_REQUEST  = "1.2.840.113556.1.4.473"
     SORT_RESPONSE = "1.2.840.113556.1.4.474"
+    VLV_REQUEST   = "2.16.840.1.113730.3.4.9"
+    VLV_RESPONSE  = "2.16.840.1.113730.3.4.10"
     DELETE_TREE   = "1.2.840.113556.1.4.805"
   end
 
@@ -798,6 +805,98 @@ class Net::LDAP
         end
       else
         @result.success?
+      end
+    end
+  end
+
+  # Searches the LDAP directory using a Virtual List View (VLV) request
+  # control (draft-ietf-ldapext-ldapv3-vlv) together with the server-side
+  # sort control (RFC 2891). This is suited for browsing very large result
+  # sets: instead of paging through the whole list, the server positions a
+  # window over the sorted list and returns only the entries in that
+  # window.
+  #
+  # Takes a hash argument with the same search parameters as #search
+  # (:base, :filter, :attributes, :scope, :deref, :time), plus:
+  # * :sort_controls (required; same format as #search, the VLV window is
+  #   positioned within the list sorted by these keys);
+  # * :offset and :content_count (position the window at a 1-based offset
+  #   within the sorted list; :content_count is the client's estimate of
+  #   the list size, use 0 when unknown);
+  # * :assertion_value (position the window at the first entry greater
+  #   than or equal to this value; exactly one of :offset or
+  #   :assertion_value must be given);
+  # * :before_count and :after_count (the number of entries to return
+  #   before and after the target entry);
+  # * :context (a Net::LDAP::VLVContext from the result of a previous VLV
+  #   search, allowing the server to reuse its cached list. A context is
+  #   bound to the connection and the search criteria it was created with;
+  #   reusing it with a different filter, different sort keys or another
+  #   connection raises ArgumentError).
+  #
+  # Returns a Net::LDAP::VLVResult exposing the window's #entries, the
+  # actual #target_position within the sorted list, the server's estimated
+  # list size (#content_count) and a #context for follow-up searches.
+  # Returns nil when the search fails; call #get_operation_result for the
+  # error information returned by the server (including sort and VLV
+  # specific result codes).
+  #
+  # Note that a VLV context is tied to a single connection, so window
+  # movements that reuse a context must happen inside an #open block:
+  #
+  #  ldap.open do |conn|
+  #    result = conn.search_virtual_list_view(
+  #      :base => "ou=people,dc=example,dc=com",
+  #      :filter => "(objectClass=person)",
+  #      :sort_controls => ["sn"],
+  #      :assertion_value => "smith",
+  #      :before_count => 3,
+  #      :after_count => 6)
+  #    # move the window ten entries forward, reusing the server context:
+  #    result = conn.search_virtual_list_view(
+  #      :base => "ou=people,dc=example,dc=com",
+  #      :filter => "(objectClass=person)",
+  #      :sort_controls => ["sn"],
+  #      :offset => result.target_position + 10,
+  #      :content_count => result.content_count,
+  #      :before_count => 3,
+  #      :after_count => 6,
+  #      :context => result.context)
+  #  end
+  def search_virtual_list_view(args = {})
+    args = args.dup
+    args[:base] ||= @base
+
+    result_set = []
+    vlv_result = nil
+
+    instrument "search_virtual_list_view.net_ldap", args do |payload|
+      @result = use_connection(args) do |conn|
+        pdu = conn.search_virtual_list_view(args) do |entry|
+          result_set << entry
+          yield entry if block_given?
+        end
+
+        if pdu && pdu.result_code == Net::LDAP::ResultCodeSuccess
+          control = pdu.result_controls.find do |c|
+            c.oid == Net::LDAP::LDAPControls::VLV_RESPONSE
+          end
+          target_position, content_count, _vlv_code, context_id =
+            control.value.read_ber
+
+          vlv_result = Net::LDAP::VLVResult.new(
+            entries: result_set,
+            target_position: target_position,
+            content_count: content_count,
+            context: Net::LDAP::VLVContext.new(
+              conn, Net::LDAP::VLVContext.signature(args), context_id))
+        end
+
+        pdu
+      end
+
+      if @result && ResultCodesSearchSuccess.include?(@result.result_code)
+        vlv_result
       end
     end
   end

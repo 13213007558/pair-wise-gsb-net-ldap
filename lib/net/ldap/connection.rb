@@ -296,17 +296,250 @@ class Net::LDAP::Connection #:nodoc:
     return sort_definitions unless sort_definitions
 
     sort_control_values = sort_definitions.map do |control|
-      control = Array(control) # if there is only an attribute name as a string then infer the orderinrule and reverseorder
-      control[0] = String(control[0]).to_ber,
-      control[1] = String(control[1]).to_ber,
-      control[2] = (control[2] == true).to_ber
-      control.to_ber_sequence
+      # if there is only an attribute name as a string then infer the
+      # ordering rule and reverse order; never modify the caller's array,
+      # it may be reused for subsequent searches
+      attribute, matching_rule, reverse_order = Array(control)
+      [
+        String(attribute).to_ber,
+        String(matching_rule).to_ber,
+        (reverse_order == true).to_ber,
+      ].to_ber_sequence
     end
     [
       Net::LDAP::LDAPControls::SORT_REQUEST.to_ber,
       false.to_ber,
       sort_control_values.to_ber_sequence.to_s.to_ber,
     ].to_ber_sequence
+  end
+
+  #--
+  # Encodes a Virtual List View request control
+  # (draft-ietf-ldapext-ldapv3-vlv), to be sent together with a server-side
+  # sort control (see #encode_sort_controls).
+  #
+  # The target of the window is given either by position (+offset+ within
+  # the sorted list, together with the client's +content_count+ estimate of
+  # the list size, 0 when unknown) or by value (+assertion_value+, the
+  # window is positioned at the first entry greater than or equal to it).
+  #
+  # +context_id+ is the opaque contextID returned by the server in an
+  # earlier VLV response; it is only valid on this connection and for the
+  # same search criteria.
+  #
+  def encode_vlv_controls(before_count:, after_count:, offset: nil, content_count: nil, assertion_value: nil, context_id: nil)
+    target =
+      if assertion_value
+        # greaterOrEqual [1] AssertionValue
+        assertion_value.to_s.to_ber_contextspecific(1)
+      else
+        # byoffset [0] SEQUENCE { offset INTEGER, contentCount INTEGER }
+        [offset.to_ber, content_count.to_ber].to_ber_contextspecific(0)
+      end
+
+    vlv_request = [
+      before_count.to_ber,
+      after_count.to_ber,
+      target,
+    ]
+    # the contextID is server-generated and may be binary data, so do not
+    # UTF-8 encode it
+    vlv_request << context_id.to_ber_bin if context_id
+
+    [
+      Net::LDAP::LDAPControls::VLV_REQUEST.to_ber,
+      false.to_ber,
+      vlv_request.to_ber_sequence.to_s.to_ber,
+    ].to_ber_sequence
+  end
+
+  #--
+  # search_virtual_list_view
+  #
+  # Searches the LDAP directory using a Virtual List View (VLV) request
+  # control (draft-ietf-ldapext-ldapv3-vlv) together with the server-side
+  # sort control (RFC 2891), and yields each entry of the returned window
+  # to the caller as it is received.
+  #
+  # Sort and VLV failures reported in the response controls are preserved
+  # as the result code of the returned PDU. A successful search response
+  # that is missing either response control is a protocol error: the
+  # received entries are not the requested window and must not be mistaken
+  # for a successful empty window.
+  #++
+  def search_virtual_list_view(args)
+    # filtering, scoping, search base
+    filter = args[:filter] || Net::LDAP::Filter.eq("objectClass", "*")
+    base   = args[:base]
+    scope  = args[:scope] || Net::LDAP::SearchScope_WholeSubtree
+
+    # attr handling
+    attrs      = Array(args[:attributes])
+    attrs_only = args[:attributes_only] == true
+
+    # references
+    refs  = args[:return_referrals] == true
+    deref = args[:deref] || Net::LDAP::DerefAliases_Never
+
+    # time limit
+    time = args[:time].to_i
+
+    # sorting (required) and VLV windowing
+    sort          = args.fetch(:sort_controls, false)
+    before_count  = args.fetch(:before_count, 0).to_i
+    after_count   = args.fetch(:after_count, 0).to_i
+    offset        = args[:offset]
+    content_count = args[:content_count]
+    assertion     = args[:assertion_value]
+
+    # arg validation
+    raise ArgumentError, "search base is required" unless base
+    raise ArgumentError, "invalid search scope" unless Net::LDAP::SearchScopes.include?(scope)
+    raise ArgumentError, "invalid alias dereferencing value" unless Net::LDAP::DerefAliasesArray.include?(deref)
+    raise ArgumentError, "sort controls are required for a VLV search" unless sort
+    raise ArgumentError, "invalid before count" unless before_count >= 0
+    raise ArgumentError, "invalid after count" unless after_count >= 0
+
+    if offset.nil? == assertion.nil?
+      raise ArgumentError, "exactly one of :offset or :assertion_value is required"
+    end
+
+    if offset
+      offset = offset.to_i
+      raise ArgumentError, "invalid offset" unless offset >= 1
+      content_count = content_count.to_i
+      raise ArgumentError, "invalid content count" unless content_count >= 0
+    else
+      content_count = nil
+    end
+
+    # A VLV context is bound to the connection that created it and to the
+    # search criteria (base, scope, dereferencing, filter and sort keys) it
+    # was created with; it cannot be reused once any of those change.
+    context_id = nil
+    if (context = args[:context])
+      unless context.is_a?(Net::LDAP::VLVContext) &&
+             context.reusable_for?(self, Net::LDAP::VLVContext.signature(args))
+        raise ArgumentError, "VLV context belongs to a different connection or search criteria"
+      end
+      context_id = context.context_id
+    end
+
+    # arg transforms
+    filter = Net::LDAP::Filter.construct(filter) if filter.is_a?(String)
+    ber_attrs = attrs.map { |attr| attr.to_s.to_ber }
+    ber_sort  = encode_sort_controls(sort)
+    ber_vlv   = encode_vlv_controls(
+      before_count: before_count,
+      after_count: after_count,
+      offset: offset,
+      content_count: content_count,
+      assertion_value: assertion,
+      context_id: context_id,
+    )
+
+    message_id = next_msgid
+
+    instrument "search_virtual_list_view.net_ldap_connection",
+               message_id: message_id,
+               filter:     filter,
+               base:       base,
+               scope:      scope,
+               time:       time,
+               sort:       sort,
+               referrals:  refs,
+               deref:      deref,
+               attributes: attrs do |payload|
+      request = [
+        base.to_ber,
+        scope.to_ber_enumerated,
+        deref.to_ber_enumerated,
+        0.to_ber, # size limit: the VLV window bounds the result set
+        time.to_ber,
+        attrs_only.to_ber,
+        filter.to_ber,
+        ber_attrs.to_ber_sequence,
+      ].to_ber_appsequence(Net::LDAP::PDU::SearchRequest)
+
+      user_controls = args.fetch(:controls, [])
+      controls = ([ber_sort, ber_vlv] + user_controls).to_ber_contextspecific(0)
+
+      write(request, controls, message_id)
+
+      result_pdu = nil
+      result_controls = []
+      n_results = 0
+
+      while pdu = queued_read(message_id)
+        case pdu.app_tag
+        when Net::LDAP::PDU::SearchReturnedData
+          n_results += 1
+          yield pdu.search_entry if block_given?
+        when Net::LDAP::PDU::SearchResultReferral
+          if refs && block_given?
+            se = Net::LDAP::Entry.new
+            se[:search_referrals] = (pdu.search_referrals || [])
+            yield se
+          end
+        when Net::LDAP::PDU::SearchResult
+          result_pdu = pdu
+          result_controls = pdu.result_controls
+          if refs && pdu.result_code == Net::LDAP::ResultCodeReferral && block_given?
+            se = Net::LDAP::Entry.new
+            se[:search_referrals] = (pdu.search_referrals || [])
+            yield se
+          end
+          break
+        else
+          raise Net::LDAP::ResponseTypeInvalidError, "invalid response-type in search: #{pdu.app_tag}"
+        end
+      end
+
+      if result_pdu.nil?
+        raise Net::LDAP::ResponseMissingOrInvalidError, "response missing"
+      end
+
+      # track total result count
+      payload[:result_count] = n_results
+
+      if result_pdu.result_code == Net::LDAP::ResultCodeSuccess
+        sort_response = nil
+        vlv_response = nil
+        result_controls.each do |control|
+          case control.oid
+          when Net::LDAP::LDAPControls::SORT_RESPONSE
+            sort_response = control.value.read_ber if control.value
+          when Net::LDAP::LDAPControls::VLV_RESPONSE
+            vlv_response = control.value.read_ber if control.value
+          end
+        end
+
+        # A successful VLV search always comes back with a sort response
+        # control; without it the server ignored our controls and the
+        # entries above are not the requested window.
+        if sort_response.nil?
+          raise Net::LDAP::ResponseMissingOrInvalidError, "missing sort response control"
+        end
+
+        sort_result_code = sort_response[0].to_i
+        if sort_result_code != Net::LDAP::ResultCodeSuccess
+          # preserve the original sort result (RFC 2891) as the search result
+          result_pdu.result[:resultCode] = sort_result_code
+        else
+          if vlv_response.nil?
+            raise Net::LDAP::ResponseMissingOrInvalidError, "missing VLV response control"
+          end
+
+          vlv_result_code = vlv_response[2].to_i
+          if vlv_result_code != Net::LDAP::ResultCodeSuccess
+            # preserve the original VLV result as the search result
+            result_pdu.result[:resultCode] = vlv_result_code
+          end
+        end
+      end
+
+      result_pdu
+    end # instrument
   end
 
   #--
