@@ -442,6 +442,8 @@ class Net::LDAP
     ResultCodeOther                        => "Other",
   }
 
+  require_relative 'ldap/referral'
+
   module LDAPControls
     PAGED_RESULTS = "1.2.840.113556.1.4.319" # Microsoft evil from RFC 2696
     SORT_REQUEST  = "1.2.840.113556.1.4.473"
@@ -556,6 +558,7 @@ class Net::LDAP
     @force_no_page = args[:force_no_page] || DefaultForceNoPage
     @encryption = normalize_encryption(args[:encryption]) # may be nil
     @connect_timeout = args[:connect_timeout]
+    @socket_class = args[:socket_class]
 
     if pr = @auth[:password] and pr.respond_to?(:call)
       @auth[:password] = pr.call
@@ -673,6 +676,11 @@ class Net::LDAP
       os.extended_response = result.extended_response
       result = result.result
     end
+    if result.respond_to?(:result)
+      result_hash = result.result
+      os.referral_trace = result.referral_trace
+      result = result_hash
+    end
     if result.is_a?(Hash)
       # We might get a hash of LDAP response codes instead of a simple
       # numeric code.
@@ -741,6 +749,14 @@ class Net::LDAP
   # * :time (an integer restricting the maximum time in seconds allowed for a search. Default is zero, no time limit RFC 4511 4.5.1.5)
   # * :deref (one of: Net::LDAP::DerefAliases_Never, Net::LDAP::DerefAliases_Search,
   #   Net::LDAP::DerefAliases_Find, Net::LDAP::DerefAliases_Always. Default is Never.)
+  # * :follow_referrals (a boolean enabling explicit SearchResultReference and
+  #   referral result chasing. Default is false.)
+  # * :referral_policy (a callable receiving the parsed LDAP URL target. Return
+  #   false/{:allow => false} to skip it, or {:allow => true, :auth => auth} to
+  #   connect with target-specific credentials. The original password is never
+  #   sent to a referral target unless the policy returns it.)
+  # * :max_referral_hops (maximum followed targets for the whole logical search.)
+  # * :on_referral_event (callback receiving referral, skipped, and failure trace events.)
   #
   # #search queries the LDAP server and passes <i>each entry</i> to the
   # caller-supplied block, as an object of type Net::LDAP::Entry. If the
@@ -784,7 +800,7 @@ class Net::LDAP
 
     instrument "search.net_ldap", args do |payload|
       @result = use_connection(args) do |conn|
-        conn.search(args) do |entry|
+        conn.search(args.merge(_root_auth: args[:auth] || @auth)) do |entry|
           result_set << entry if result_set
           yield entry if block_given?
         end
@@ -792,9 +808,12 @@ class Net::LDAP
 
       if return_result_set
         unless @result.nil?
-          if ResultCodesSearchSuccess.include?(@result.result_code)
-            result_set
-          end
+          successful_result = if @result.is_a?(Net::LDAP::Referral::Result)
+                                @result.success?
+                              else
+                                ResultCodesSearchSuccess.include?(@result.result_code)
+                              end
+          result_set if successful_result
         end
       else
         @result.success?
@@ -1343,7 +1362,8 @@ class Net::LDAP
       :hosts                   => @hosts,
       :encryption              => @encryption,
       :instrumentation_service => @instrumentation_service,
-      :connect_timeout         => @connect_timeout
+      :connect_timeout         => @connect_timeout,
+      :socket_class            => @socket_class
 
     # Force connect to see if there's a connection error
     connection.socket

@@ -21,7 +21,7 @@ class Net::LDAP::Connection #:nodoc:
     @instrumentation_service = server[:instrumentation_service]
 
     # Allows tests to parameterize what socket class to use
-    @socket_class = server.fetch(:socket_class, DefaultSocket)
+    @socket_class = server[:socket_class] || DefaultSocket
 
     yield self if block_given?
   end
@@ -319,7 +319,15 @@ class Net::LDAP::Connection #:nodoc:
   # type-5 packet, which might never come. We need to support the time-limit
   # in the protocol.
   #++
-  def search(args = nil)
+  def search(args = nil, &block)
+    if args && args[:follow_referrals] == true
+      Net::LDAP::Referral.new(self, args, @server, block).run
+    else
+      search_server(args, &block)
+    end
+  end
+
+  def search_server(args = nil)
     args ||= {}
 
     # filtering, scoping, search base
@@ -333,7 +341,8 @@ class Net::LDAP::Connection #:nodoc:
     # attr handling
     # attrs:      https://tools.ietf.org/html/rfc4511#section-4.5.1.8
     # attrs_only: https://tools.ietf.org/html/rfc4511#section-4.5.1.6
-    attrs  = Array(args[:attributes])
+    attrs  = args.key?(:attributes) ? Array(args[:attributes]) : []
+    attributes_given = args.fetch(:_attributes_given, args.key?(:attributes))
     attrs_only = args[:attributes_only] == true
 
     # references
@@ -400,16 +409,12 @@ class Net::LDAP::Connection #:nodoc:
                attributes: attrs do |payload|
       loop do
         # should collect this into a private helper to clarify the structure
-        query_limit = 0
-        if size > 0
-          query_limit = if paged
-                          (((size - n_results) < 126) ? (size - n_results) : 0)
-                        else
-                          size
-                        end
+        query_limit = size
+        if paged
+          query_limit = size <= 0 || size >= 126 ? 0 : size
         end
 
-        request = [
+        request_parts = [
           base.to_ber,
           scope.to_ber_enumerated,
           deref.to_ber_enumerated,
@@ -417,8 +422,9 @@ class Net::LDAP::Connection #:nodoc:
           time.to_ber,
           attrs_only.to_ber,
           filter.to_ber,
-          ber_attrs.to_ber_sequence,
-        ].to_ber_appsequence(Net::LDAP::PDU::SearchRequest)
+        ]
+        request_parts << ber_attrs.to_ber_sequence if attributes_given
+        request = request_parts.to_ber_appsequence(Net::LDAP::PDU::SearchRequest)
 
         # rfc2696_cookie sometimes contains binary data from Microsoft Active Directory
         # this breaks when calling to_ber. (Can't force binary data to UTF-8)
@@ -450,8 +456,11 @@ class Net::LDAP::Connection #:nodoc:
           case pdu.app_tag
           when Net::LDAP::PDU::SearchReturnedData
             n_results += 1
-            yield pdu.search_entry if block_given?
+            entry = pdu.search_entry
+            entry.ldap_source = args[:_referral_source]&.to_h if entry.respond_to?(:ldap_source=)
+            yield entry if block_given?
           when Net::LDAP::PDU::SearchResultReferral
+            args[:_referral_handler]&.call(pdu, args[:_referral_source])
             if refs
               if block_given?
                 se = Net::LDAP::Entry.new
@@ -462,6 +471,7 @@ class Net::LDAP::Connection #:nodoc:
           when Net::LDAP::PDU::SearchResult
             result_pdu = pdu
             controls = pdu.result_controls
+            args[:_referral_handler]&.call(pdu, args[:_referral_source]) if pdu.result_code == Net::LDAP::ResultCodeReferral
             if refs && pdu.result_code == Net::LDAP::ResultCodeReferral
               if block_given?
                 se = Net::LDAP::Entry.new
