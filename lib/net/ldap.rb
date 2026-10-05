@@ -446,6 +446,8 @@ class Net::LDAP
     PAGED_RESULTS = "1.2.840.113556.1.4.319" # Microsoft evil from RFC 2696
     SORT_REQUEST  = "1.2.840.113556.1.4.473"
     SORT_RESPONSE = "1.2.840.113556.1.4.474"
+    VLV_REQUEST   = "2.16.840.1.113730.3.4.9"
+    VLV_RESPONSE  = "2.16.840.1.113730.3.4.10"
     DELETE_TREE   = "1.2.840.113556.1.4.805"
   end
 
@@ -799,6 +801,83 @@ class Net::LDAP
       else
         @result.success?
       end
+    end
+  end
+
+  # #search_vlv performs a search using the LDAP Virtual List View (VLV)
+  # request control (draft-ietf-ldapext-ldapv3-vlv) together with the
+  # server-side sort control (RFC 2891). It lets a client jump directly to a
+  # window of entries inside a large sorted result set instead of paging
+  # through it one page at a time.
+  #
+  # In addition to the usual #search arguments, the following are supported:
+  #
+  # * :sort_controls => server-side sort definitions (required, VLV results
+  #   are only meaningful on a sorted list). Same format as #search, e.g.
+  #   <tt>["sn"]</tt> or <tt>[["sn", "caseIgnoreOrderingMatch", false]]</tt>.
+  # * :vlv => a Hash describing the requested window:
+  #   * :before_count => number of entries before the target to return.
+  #   * :after_count => number of entries after the target to return.
+  #   * :offset => 1-based position of the target entry (by position).
+  #   * :content_count => the caller's estimate of the list size; pass the
+  #     +content_count+ returned by a previous call, or 0 if unknown.
+  #   * :assertion => position the window by assertion value instead of by
+  #     offset, e.g. <tt>"smith"</tt> to jump to the first entry whose sort
+  #     key is greater than or equal to the value.
+  # * :vlv_context => an optional Hash used to carry the VLV context ID
+  #   between calls. Pass the same Hash on subsequent calls to let the
+  #   server resume its cached list. The context is only reused while the
+  #   connection, filter and sort keys stay the same; changing any of them
+  #   (or using a different connection) discards the stored context ID.
+  #
+  # Returns a result object (an OpenStruct) with the following members:
+  #
+  # * :entries => the window of Net::LDAP::Entry objects.
+  # * :target_position => the actual 1-based position of the target entry.
+  # * :content_count => the server's estimate of the total list size.
+  # * :context_id => the VLV context ID returned by the server, if any.
+  # * :before_count / :after_count => the requested window sizes.
+  # * :result_code / :error_message / :status => the overall outcome.
+  # * :sort_result_code / :vlv_result_code => the result codes reported by
+  #   the sort and VLV response controls, preserved separately. A missing
+  #   VLV response control is treated as a failure, not as an empty window.
+  #
+  #  context = {}
+  #  ldap.open do |ldap|
+  #    result = ldap.search_vlv(:base => "ou=People,dc=example,dc=com",
+  #                             :filter => "(objectClass=person)",
+  #                             :sort_controls => ["sn"],
+  #                             :vlv => { :before_count => 5, :after_count => 4,
+  #                                       :offset => 100, :content_count => 0 },
+  #                             :vlv_context => context)
+  #    result.entries.each { |entry| puts entry.dn }
+  #  end
+  def search_vlv(args = {})
+    args = args.dup
+    args[:base] ||= @base
+
+    instrument "search.net_ldap", args do |payload|
+      result_set = []
+
+      vlv_result = use_connection(args) do |conn|
+        conn.search_vlv(args) do |entry|
+          result_set << entry
+          yield entry if block_given?
+        end
+      end
+
+      if vlv_result.respond_to?(:result_code) && !vlv_result.is_a?(Net::LDAP::PDU)
+        vlv_result.entries = result_set
+        @result = {
+          :resultCode   => vlv_result.result_code,
+          :errorMessage => vlv_result.error_message,
+          :matchedDN    => "",
+        }
+      else
+        @result = vlv_result
+      end
+
+      vlv_result
     end
   end
 

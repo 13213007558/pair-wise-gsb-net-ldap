@@ -1,3 +1,9 @@
+=== Net::LDAP 0.20.1
+* Add Virtual List View (VLV) search support via Net::LDAP#search_vlv, used
+  together with the server-side sort control
+* Fix Net::LDAP::Connection#encode_sort_controls modifying caller-supplied
+  sort definitions
+
 === Net::LDAP 0.20.0
 * Update test.yml by @HarlemSquirrel in #433
 * Add `ostruct` as a dependency to the gemspec by @Ivanov-Anton in #432
