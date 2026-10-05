@@ -319,7 +319,13 @@ class Net::LDAP::Connection #:nodoc:
   # type-5 packet, which might never come. We need to support the time-limit
   # in the protocol.
   #++
-  def search(args = nil)
+  def search(args = nil, &block)
+    search_with_events(args) do |event, value|
+      block&.call(value) if event == :entry
+    end
+  end
+
+  def search_with_events(args = nil)
     args ||= {}
 
     # filtering, scoping, search base
@@ -450,15 +456,19 @@ class Net::LDAP::Connection #:nodoc:
           case pdu.app_tag
           when Net::LDAP::PDU::SearchReturnedData
             n_results += 1
-            yield pdu.search_entry if block_given?
+            if block_given?
+              yield :entry, pdu.search_entry
+              yield :search_referral, pdu.search_referrals if pdu.search_referrals
+            end
           when Net::LDAP::PDU::SearchResultReferral
             if refs
               if block_given?
                 se = Net::LDAP::Entry.new
                 se[:search_referrals] = (pdu.search_referrals || [])
-                yield se
+                yield :entry, se
               end
             end
+            yield :search_referral, pdu.search_referrals if block_given? && pdu.search_referrals
           when Net::LDAP::PDU::SearchResult
             result_pdu = pdu
             controls = pdu.result_controls
@@ -466,9 +476,10 @@ class Net::LDAP::Connection #:nodoc:
               if block_given?
                 se = Net::LDAP::Entry.new
                 se[:search_referrals] = (pdu.search_referrals || [])
-                yield se
+                yield :entry, se
               end
             end
+            yield :result, result_pdu if block_given?
             break
           else
             raise Net::LDAP::ResponseTypeInvalidError, "invalid response-type in search: #{pdu.app_tag}"

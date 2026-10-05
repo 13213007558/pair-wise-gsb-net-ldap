@@ -261,6 +261,8 @@ Net::LDAP::AuthAdapter.register(:sasl, Net::LDAP::AuthAdapter::Sasl)
 class Net::LDAP
   include Net::LDAP::Instrumentation
 
+  attr_reader :last_search_report
+
   SearchScope_BaseObject = 0
   SearchScope_SingleLevel = 1
   SearchScope_WholeSubtree = 2
@@ -272,6 +274,7 @@ class Net::LDAP
   DerefAliases_Find = 2
   DerefAliases_Always = 3
   DerefAliasesArray = [DerefAliases_Never, DerefAliases_Search, DerefAliases_Find, DerefAliases_Always]
+  require_relative 'ldap/referral'
 
   primitive = { 2 => :null } # UnbindRequest body
   constructed = {
@@ -669,6 +672,17 @@ class Net::LDAP
   def get_operation_result
     result = @result
     os = OpenStruct.new
+    if result.is_a?(Net::LDAP::SearchAggregateResult)
+      os.code = result.result_code
+      os.error_message = result.error_message
+      os.matched_dn = result.matched_dn
+      os.search_report = result.report
+      os.referrals = result.report.referrals
+      os.skipped_referrals = result.report.skipped
+      os.failures = result.report.failures
+      os.message = Net::LDAP.result2string(os.code)
+      return os
+    end
     if result.is_a?(Net::LDAP::PDU)
       os.extended_response = result.extended_response
       result = result.result
@@ -773,8 +787,8 @@ class Net::LDAP
   #      end
   #    end
   #  end
-  def search(args = {})
-    unless args[:ignore_server_caps]
+  def search(args = {}, &block)
+    unless args[:ignore_server_caps] || args[:follow_referrals]
       args[:paged_searches_supported] = paged_searches_supported?
     end
 
@@ -783,23 +797,34 @@ class Net::LDAP
     result_set = return_result_set ? [] : nil
 
     instrument "search.net_ldap", args do |payload|
-      @result = use_connection(args) do |conn|
-        conn.search(args) do |entry|
-          result_set << entry if result_set
-          yield entry if block_given?
-        end
-      end
-
-      if return_result_set
-        unless @result.nil?
-          if ResultCodesSearchSuccess.include?(@result.result_code)
-            result_set
+      if args[:follow_referrals]
+        search_with_referrals(args, result_set, block, payload)
+      else
+        @last_search_report = nil
+        @result = use_connection(args) do |conn|
+          conn.search(args) do |entry|
+            result_set << entry if result_set
+            block.call(entry) if block
           end
         end
-      else
-        @result.success?
+
+        if return_result_set
+          unless @result.nil?
+            if ResultCodesSearchSuccess.include?(@result.result_code)
+              result_set
+            end
+          end
+        else
+          @result.success?
+        end
       end
     end
+  end
+
+  def referral_events
+    return [] unless @last_search_report
+
+    @last_search_report.referrals + @last_search_report.skipped
   end
 
   # #bind connects to an LDAP server and requests authentication based on
@@ -1315,6 +1340,47 @@ class Net::LDAP
   end
 
   private
+
+  def search_with_referrals(args, _result_set, block, payload)
+    search_args = args.dup
+    search_args[:ignore_server_caps] = true
+    search_args[:host] ||= @host
+    search_args[:port] ||= @port
+    search_args[:encryption] ||= @encryption
+    search_args[:auth] ||= @auth
+    follower = ReferralFollower.new(search_args, method(:referral_connection), block)
+    aggregate = follower.run
+    @last_search_report = aggregate.report
+    @result = aggregate
+    payload[:report] = aggregate.report
+
+    if aggregate.success? || args[:return_result] == false
+      args[:return_result] == false ? aggregate.success? : aggregate.report.entries.map(&:first)
+    else
+      aggregate.report.entries.map(&:first) unless aggregate.report.entries.empty?
+    end
+  end
+
+  def referral_connection(args)
+    if @open_connection && args[:host] == @host && args[:port] == @port
+      args[:auth] ||= @auth
+      return [@open_connection, false]
+    end
+
+    connection = Net::LDAP::Connection.new(
+      :host => args[:host],
+      :port => args[:port],
+      :hosts => args[:hosts],
+      :encryption => args[:encryption],
+      :instrumentation_service => @instrumentation_service,
+      :connect_timeout => args[:connect_timeout] || @connect_timeout
+    )
+    result = connection.bind(args[:auth] || DefaultAuth)
+    return [connection, true] if result.result_code == ResultCodeSuccess
+
+    connection.close
+    [FailedReferralConnection.new(result), true]
+  end
 
   # Yields an open connection if there is one, otherwise establishes a new
   # connection, binds, and yields it. If binding fails, it will return the

@@ -42,6 +42,8 @@
 # symbol. Unfortunately we do this in at least three places. Should do it in
 # ONE place.
 class Net::LDAP::Entry
+  attr_accessor :ldap_source
+
   ##
   # This constructor is not generally called by user code.
   def initialize(dn = nil) #:nodoc:
