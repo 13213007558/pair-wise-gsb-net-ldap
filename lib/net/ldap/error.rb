@@ -46,4 +46,6 @@ class Net::LDAP
   class FilterTypeUnknownError < Error; end
   class FilterSyntaxInvalidError < Error; end
   class EntryOverflowError < Error; end
+  class ConnectionClosedError < Error; end
+  class OperationTimeoutError < Error; end
 end

@@ -114,6 +114,8 @@ class Net::LDAP::PDU
       parse_ldap_result(ber_object[1])
     when ModifyRDNResponse
       parse_ldap_result(ber_object[1])
+    when CompareResponse
+      parse_ldap_result(ber_object[1])
     when SearchRequest
       parse_ldap_search_request(ber_object[1])
     when BindRequest
@@ -159,6 +161,31 @@ class Net::LDAP::PDU
 
   def failure?
     !success?
+  end
+
+  ##
+  # True when this PDU terminates the outstanding request identified by
+  # #message_id. Search entries (SearchReturnedData) and search referrals do
+  # not terminate an operation; every other server response does.
+  #
+  # A SearchResultReferral associated with the *result* of a search is
+  # attached to the following SearchResult PDU by the server, so it is never
+  # itself a terminating response.
+  def terminal?
+    case @app_tag
+    when SearchReturnedData, SearchResultReferral
+      false
+    else
+      true
+    end
+  end
+
+  ##
+  # True when the client gave up waiting for this operation because the
+  # connection was closed. Such terminal results are synthesized by
+  # Net::LDAP and never arrive over the wire.
+  def connection_closed?
+    result_code == Net::LDAP::ResultCodeConnectionClosed
   end
 
   ##
