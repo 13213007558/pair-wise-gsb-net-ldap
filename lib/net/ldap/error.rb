@@ -2,6 +2,7 @@ class Net::LDAP
   class Error < StandardError; end
 
   class AlreadyOpenedError < Error; end
+  class ConnectionNotOpenError < Error; end
   class SocketError < Error; end
   class ConnectionError < Error
     def self.new(errors)

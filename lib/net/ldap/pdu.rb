@@ -114,6 +114,8 @@ class Net::LDAP::PDU
       parse_ldap_result(ber_object[1])
     when ModifyRDNResponse
       parse_ldap_result(ber_object[1])
+    when CompareResponse
+      parse_ldap_result(ber_object[1])
     when SearchRequest
       parse_ldap_search_request(ber_object[1])
     when BindRequest

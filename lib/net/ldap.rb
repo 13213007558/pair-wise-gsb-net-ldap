@@ -19,6 +19,7 @@ require 'socket'
 
 require_relative 'ber'
 require_relative 'ldap/pdu'
+require_relative 'ldap/operation'
 require_relative 'ldap/filter'
 require_relative 'ldap/dataset'
 require_relative 'ldap/password'
@@ -293,6 +294,7 @@ class Net::LDAP
     15 => :array, # CompareResponse
     16 => :array, # AbandonRequest
     19 => :array, # SearchResultReferral
+    23 => :array, # ExtendedRequest
     24 => :array, # Unsolicited Notification
   }
   application = {
@@ -301,7 +303,7 @@ class Net::LDAP
   }
   primitive = {
     0 => :string, # password
-    1 => :string, # Kerberos v4
+    1 => :string, # Kerberos v4 / RFC 3909 cancelRequestValue [1] OCTET STRING
     2 => :string, # Kerberos v5
     3 => :string, # SearchFilter-extensible
     4 => :string, # SearchFilter-extensible
@@ -342,6 +344,8 @@ class Net::LDAP
   StartTlsOid = '1.3.6.1.4.1.1466.20037'
   PasswdModifyOid = '1.3.6.1.4.1.4203.1.11.1'
   WhoamiOid = '1.3.6.1.4.1.4203.1.11.3'
+  # RFC 3909 Cancel
+  CancelOid = '1.3.6.1.1.8'
 
   # https://tools.ietf.org/html/rfc4511#section-4.1.9
   # https://tools.ietf.org/html/rfc4511#appendix-A
@@ -382,6 +386,11 @@ class Net::LDAP
   ResultCodeEntryAlreadyExists           = 68
   ResultCodeObjectClassModsProhibited    = 69
   ResultCodeAffectsMultipleDSAs          = 71
+  # RFC 3909: the target operation was cancelled
+  ResultCodeCanceled                     = 118
+  # Synthetic result used when a connection goes away before the server
+  # returns a terminal result. Not an LDAP wire result code.
+  ResultCodeConnectionClosed             = -1
   ResultCodeOther                        = 80
 
   # https://tools.ietf.org/html/rfc4511#appendix-A.1
@@ -439,6 +448,8 @@ class Net::LDAP
     ResultCodeEntryAlreadyExists           => "Entry Already Exists",
     ResultCodeObjectClassModsProhibited    => "ObjectClass Modifications Prohibited",
     ResultCodeAffectsMultipleDSAs          => "Affects Multiple DSAs",
+    ResultCodeCanceled                     => "Canceled",
+    ResultCodeConnectionClosed             => "Connection Closed",
     ResultCodeOther                        => "Other",
   }
 
@@ -799,6 +810,64 @@ class Net::LDAP
       else
         @result.success?
       end
+    end
+  end
+
+  # Starts a search without blocking, returning an Net::LDAP::Operation.
+  # Accepts the same arguments as #search (except +:return_result+, which
+  # has no meaning for an in-progress operation).
+  #
+  # Unlike #search, this does not consume the connection while waiting for
+  # entries. Several searches (and short operations such as #compare) can
+  # be started on the same connection and their results interleaved; each
+  # response is attributed to its own message ID. Entries may be consumed
+  # with Operation#each_entry (streaming) or Operation#drain_entries
+  # (non-blocking), and the terminal result with Operation#wait. Cancel a
+  # still-running search with Operation#cancel (RFC 3909).
+  #
+  # Concurrent operations require a persistent connection, so use this
+  # inside an #open block (or after assigning #connection). Raises
+  # Net::LDAP::ConnectionNotOpenError otherwise.
+  #
+  #  Net::LDAP.open(:host => "dir.example.com") do |ldap|
+  #    long  = ldap.start_search(:base => treebase, :filter => big_filter)
+  #    short = ldap.start_search(:base => treebase, :filter => small_filter)
+  #    short.each_entry { |entry| handle(entry) }
+  #    long.cancel if done_early
+  #  end
+  def start_search(args = {}, &block)
+    args = args.dup
+    conn = operation_connection
+    unless args[:ignore_server_caps]
+      args[:paged_searches_supported] = paged_searches_supported?
+    end
+    args[:base] ||= @base
+    conn.start_search(args, &block)
+  end
+
+  # Starts an LDAP Compare assertion (RFC 4511 4.10) without blocking and
+  # returns an Net::LDAP::Operation. The assertion is described by :dn,
+  # :attribute and :value. Wait for the result with Operation#wait; result
+  # code Net::LDAP::ResultCodeCompareTrue means the assertion held, and
+  # Net::LDAP::ResultCodeCompareFalse means it did not (both are non-error
+  # results).
+  #
+  # Like #start_search, this requires an #open connection so the compare
+  # can be interleaved with outstanding searches.
+  def start_compare(args)
+    operation_connection.start_compare(args)
+  end
+
+  # Performs an LDAP Compare assertion and blocks until the result
+  # arrives. Returns true when the assertion holds (result code
+  # compareTrue) and false for compareFalse and errors. Use
+  # #get_operation_result for details.
+  def compare(args)
+    instrument "compare.net_ldap", args do
+      @result = use_connection(args) do |conn|
+        conn.compare(args)
+      end
+      @result.success?
     end
   end
 
@@ -1315,6 +1384,18 @@ class Net::LDAP
   end
 
   private
+
+  # Returns the persistent connection used for concurrent operations.
+  # Concurrent operations cannot be multiplexed over a connection that is
+  # closed after each call, so require one established via #open (or
+  # injected for testing).
+  def operation_connection
+    unless @open_connection
+      raise Net::LDAP::ConnectionNotOpenError,
+            "concurrent operations require an open connection; use Net::LDAP#open"
+    end
+    @open_connection
+  end
 
   # Yields an open connection if there is one, otherwise establishes a new
   # connection, binds, and yields it. If binding fails, it will return the
