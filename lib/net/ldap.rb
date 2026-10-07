@@ -27,6 +27,7 @@ require_relative 'ldap/instrumentation'
 require_relative 'ldap/connection'
 require_relative 'ldap/version'
 require_relative 'ldap/error'
+require_relative 'ldap/schema'
 require_relative 'ldap/auth_adapter'
 require_relative 'ldap/auth_adapter/simple'
 require_relative 'ldap/auth_adapter/sasl'
@@ -1250,8 +1251,9 @@ class Net::LDAP
   # Return the root Subschema record from the LDAP server as a
   # Net::LDAP::Entry, or an empty Entry if the server doesn't return the
   # record. On success, the Net::LDAP::Entry returned from this call will
-  # have the attributes :dn, :objectclasses, and :attributetypes. If there
-  # is an error, call #get_operation_result for more information.
+  # have the attributes :dn, :objectclasses, :attributetypes,
+  # :ditcontentrules, and :nameforms. If there is an error, call
+  # #get_operation_result for more information.
   #
   #  ldap = Net::LDAP.new
   #  ldap.host = "your.ldap.host"
@@ -1283,7 +1285,12 @@ class Net::LDAP
     rs = search(:ignore_server_caps => true, :base => subschema_name.first,
                 :scope => SearchScope_BaseObject,
                 :filter => "objectclass=subschema",
-                :attributes => [:objectclasses, :attributetypes])
+                :attributes => [
+                  :objectclasses,
+                  :attributetypes,
+                  :ditcontentrules,
+                  :nameforms,
+                ])
     (rs and rs.first) or Net::LDAP::Entry.new
   end
 
