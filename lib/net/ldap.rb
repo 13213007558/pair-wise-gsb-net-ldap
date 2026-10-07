@@ -23,6 +23,7 @@ require_relative 'ldap/filter'
 require_relative 'ldap/dataset'
 require_relative 'ldap/password'
 require_relative 'ldap/entry'
+require_relative 'ldap/schema'
 require_relative 'ldap/instrumentation'
 require_relative 'ldap/connection'
 require_relative 'ldap/version'
@@ -971,6 +972,20 @@ class Net::LDAP
     end
   end
 
+  # Validates an entry against a subschema entry without contacting the
+  # directory. The subschema entry is normally obtained from
+  # #search_subschema_entry and must include attributeTypes, objectClasses,
+  # dITContentRules, and nameForms when those checks are desired. Returns a
+  # Net::LDAP::Schema::Result containing separate +violations+ and
+  # +unchecked+ lists. Values whose syntax or equality matching rule is not
+  # registered locally are reported in +unchecked+, not treated as valid.
+  #
+  # dITStructureRules are not evaluated, and no assumption is made about the
+  # real parent entry in the directory.
+  def validate_entry_against_schema(subschema_entry, dn, attributes)
+    Schema.check_entry(subschema_entry, dn, attributes)
+  end
+
   # Modifies the attribute values of a particular entry on the LDAP
   # directory. Takes a hash with arguments. Supported arguments are:
   # :dn :: (the full DN of the entry whose attributes are to be modified)
@@ -1283,7 +1298,8 @@ class Net::LDAP
     rs = search(:ignore_server_caps => true, :base => subschema_name.first,
                 :scope => SearchScope_BaseObject,
                 :filter => "objectclass=subschema",
-                :attributes => [:objectclasses, :attributetypes])
+                :attributes => [:objectclasses, :attributetypes,
+                                :ditcontentrules, :nameforms])
     (rs and rs.first) or Net::LDAP::Entry.new
   end
 
