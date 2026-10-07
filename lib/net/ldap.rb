@@ -23,6 +23,7 @@ require_relative 'ldap/filter'
 require_relative 'ldap/dataset'
 require_relative 'ldap/password'
 require_relative 'ldap/entry'
+require_relative 'ldap/controls'
 require_relative 'ldap/instrumentation'
 require_relative 'ldap/connection'
 require_relative 'ldap/version'
@@ -383,6 +384,7 @@ class Net::LDAP
   ResultCodeObjectClassModsProhibited    = 69
   ResultCodeAffectsMultipleDSAs          = 71
   ResultCodeOther                        = 80
+  ResultCodeAssertionFailed              = 122
 
   # https://tools.ietf.org/html/rfc4511#appendix-A.1
   ResultCodesNonError = [
@@ -440,7 +442,30 @@ class Net::LDAP
     ResultCodeObjectClassModsProhibited    => "ObjectClass Modifications Prohibited",
     ResultCodeAffectsMultipleDSAs          => "Affects Multiple DSAs",
     ResultCodeOther                        => "Other",
+    ResultCodeAssertionFailed              => "Assertion Failed",
   }
+
+  ##
+  # The result object returned by Net::LDAP#get_operation_result. It
+  # behaves like the OpenStruct it inherits from, and adds predicates
+  # that keep the different write-failure modes distinguishable:
+  # #assertion_failed? (RFC 4528 assertionFailed, result code 122),
+  # #unavailable_critical_extension? (result code 12, e.g. the server
+  # does not know one of the critical controls that were sent), and
+  # #success? for ordinary results.
+  class OperationResult < OpenStruct
+    def success?
+      code == Net::LDAP::ResultCodeSuccess
+    end
+
+    def assertion_failed?
+      code == Net::LDAP::ResultCodeAssertionFailed
+    end
+
+    def unavailable_critical_extension?
+      code == Net::LDAP::ResultCodeUnavailableCriticalExtension
+    end
+  end
 
   module LDAPControls
     PAGED_RESULTS = "1.2.840.113556.1.4.319" # Microsoft evil from RFC 2696
@@ -567,6 +592,11 @@ class Net::LDAP
     # our internal methods will connect using it, or else they will create
     # their own.
     @open_connection = nil
+
+    # Which read-entry controls (RFC 4527) the last write operation
+    # requested. Used to interpret the response controls.
+    @pre_read_requested = false
+    @post_read_requested = false
   end
 
   # Convenience method to specify authentication credentials to the LDAP
@@ -648,9 +678,9 @@ class Net::LDAP
   end
 
   # Returns a meaningful result any time after a protocol operation (#bind,
-  # #search, #add, #modify, #rename, #delete) has completed. It returns an
-  # #OpenStruct containing an LDAP result code (0 means success), and a
-  # human-readable string.
+  # #search, #add, #modify, #rename, #delete) has completed. It returns a
+  # Net::LDAP::OperationResult (an #OpenStruct) containing an LDAP result
+  # code (0 means success), and a human-readable string.
   #
   #  unless ldap.bind
   #    puts "Result: #{ldap.get_operation_result.code}"
@@ -662,15 +692,27 @@ class Net::LDAP
   # #get_operation_result.error_message and
   # #get_operation_result.matched_dn.
   #
+  # Write operations performed with the :pre_read or :post_read options
+  # (see #modify) also expose #get_operation_result.pre_read_entry and
+  # #get_operation_result.post_read_entry. Each of them is:
+  #
+  # * +nil+ when the corresponding control was not requested,
+  # * Net::LDAP::Controls::ENTRY_NOT_PROVIDED when it was requested but
+  #   the server did not return it, or
+  # * a Net::LDAP::Entry (possibly with an empty attribute set) built
+  #   from the corresponding response control.
+  #
   #--
   # Modified the implementation, 20Mar07. We might get a hash of LDAP
   # response codes instead of a simple numeric code.
   #++
   def get_operation_result
     result = @result
-    os = OpenStruct.new
+    os = OperationResult.new
     if result.is_a?(Net::LDAP::PDU)
       os.extended_response = result.extended_response
+      os.pre_read_entry = read_entry_result(result, :pre_read)
+      os.post_read_entry = read_entry_result(result, :post_read)
       result = result.result
     end
     if result.is_a?(Hash)
@@ -962,8 +1004,15 @@ class Net::LDAP
   #  Net::LDAP.open(:host => host) do |ldap|
   #    ldap.add(:dn => dn, :attributes => attr)
   #  end
+  #
+  # A single add may additionally carry an :assertion (a Net::LDAP::Filter
+  # evaluated atomically by the server, RFC 4528) and a :post_read
+  # attribute selection (RFC 4527). See #modify for the details of these
+  # options. (:pre_read is not allowed on add: the entry does not exist
+  # yet.)
   def add(args)
     instrument "add.net_ldap", args do |payload|
+      args = prepare_write_controls(:add, args)
       @result = use_connection(args) do |conn|
         conn.add(args)
       end
@@ -1038,6 +1087,41 @@ class Net::LDAP
   # violation). If this happens, you will probably get a result code from
   # the server that reflects only the operation that failed, and you may or
   # may not get extended information that will tell you which one failed.
+  #
+  # == Conditional writes and read-back controls
+  #
+  # A single write operation may carry additional controls, sent on the
+  # same request as the write itself (no separate search is performed):
+  #
+  # :assertion :: a Net::LDAP::Filter (or filter String) that the server
+  #               evaluates against the target entry as part of the write
+  #               (RFC 4528). If the filter does not match, the write is
+  #               not performed and the result code is
+  #               Net::LDAP::ResultCodeAssertionFailed (122), reported by
+  #               #get_operation_result.assertion_failed?.
+  # :pre_read :: an Array of attribute descriptions; the server returns
+  #              the entry as it was immediately before the write
+  #              (RFC 4527). Allowed on #modify, #delete and #rename.
+  # :post_read :: an Array of attribute descriptions; the server returns
+  #               the entry as it is immediately after the write
+  #               (RFC 4527). Allowed on #add, #modify and #rename.
+  #
+  # The requested entries are available as
+  # #get_operation_result.pre_read_entry and
+  # #get_operation_result.post_read_entry; see #get_operation_result for
+  # how "not requested", "not provided by the server" and "empty
+  # attribute set" are distinguished. For example, to bump a version
+  # attribute only if it still holds the expected value, and read the
+  # values before and after:
+  #
+  #  ldap.modify(
+  #    :dn => dn,
+  #    :operations => [[:replace, :version, 8]],
+  #    :assertion => Net::LDAP::Filter.eq(:version, 7),
+  #    :pre_read => %w(version),
+  #    :post_read => %w(version),
+  #  )
+  #
   # #modify has no notion of an atomic transaction. If you specify a chain
   # of modifications in one call to #modify, and one of them fails, the
   # preceding ones will usually not be "rolled back", resulting in a
@@ -1054,6 +1138,7 @@ class Net::LDAP
   # does _not_ imply transactional atomicity, which LDAP does not provide.
   def modify(args)
     instrument "modify.net_ldap", args do |payload|
+      args = prepare_write_controls(:modify, args)
       @result = use_connection(args) do |conn|
         conn.modify(args)
       end
@@ -1151,9 +1236,11 @@ class Net::LDAP
 
   # Rename an entry on the remote DIS by changing the last RDN of its DN.
   #
-  # _Documentation_ _stub_
+  # Supports the :assertion, :pre_read and :post_read options described
+  # under #modify.
   def rename(args)
     instrument "rename.net_ldap", args do |payload|
+      args = prepare_write_controls(:rename, args)
       @result = use_connection(args) do |conn|
         conn.rename(args)
       end
@@ -1171,8 +1258,13 @@ class Net::LDAP
   #
   #  dn = "mail=deleteme@example.com, ou=people, dc=example, dc=com"
   #  ldap.delete :dn => dn
+  #
+  # Supports the :assertion and :pre_read options described under
+  # #modify. (:post_read is not allowed on delete: the entry no longer
+  # exists afterwards.)
   def delete(args)
     instrument "delete.net_ldap", args do |payload|
+      args = prepare_write_controls(:delete, args)
       @result = use_connection(args) do |conn|
         conn.delete(args)
       end
@@ -1315,6 +1407,39 @@ class Net::LDAP
   end
 
   private
+
+  # Internal: Validates and builds the RFC 4528 assertion and RFC 4527
+  # read-entry controls for a single write operation (:add, :modify,
+  # :delete or :rename), records which read-entry controls were
+  # requested, and merges the BER-encoded controls with any
+  # caller-supplied :controls. Returns the arguments to pass on.
+  def prepare_write_controls(operation, args)
+    built = Net::LDAP::Controls.build(operation, args)
+    @pre_read_requested = built.pre_read_requested?
+    @post_read_requested = built.post_read_requested?
+    return args if built.empty?
+
+    args = args.dup
+    args[:controls] = Array(args[:controls]) + built.controls
+    args
+  end
+
+  # Internal: Extracts a pre-read or post-read entry from the response
+  # controls of a write operation. Distinguishes three states: +nil+
+  # (the control was not requested),
+  # Net::LDAP::Controls::ENTRY_NOT_PROVIDED (requested, but the server
+  # did not return it), and a Net::LDAP::Entry built from the response
+  # control (possibly with an empty attribute set).
+  def read_entry_result(pdu, kind)
+    requested = kind == :pre_read ? @pre_read_requested : @post_read_requested
+    return nil unless requested
+
+    oid = kind == :pre_read ? Net::LDAP::Controls::PRE_READ : Net::LDAP::Controls::POST_READ
+    control = pdu.ldap_controls.find { |c| c.oid == oid }
+    return Net::LDAP::Controls::ENTRY_NOT_PROVIDED unless control
+
+    Net::LDAP::Controls.parse_entry(control.value)
+  end
 
   # Yields an open connection if there is one, otherwise establishes a new
   # connection, binds, and yields it. If binding fails, it will return the

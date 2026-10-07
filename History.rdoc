@@ -1,3 +1,6 @@
+=== Net::LDAP (unreleased)
+* Add RFC 4528 assertion control and RFC 4527 pre-read/post-read controls for single write operations (#add, #modify, #delete, #rename), with pre_read_entry/post_read_entry on the operation result
+
 === Net::LDAP 0.20.0
 * Update test.yml by @HarlemSquirrel in #433
 * Add `ostruct` as a dependency to the gemspec by @Ivanov-Anton in #432

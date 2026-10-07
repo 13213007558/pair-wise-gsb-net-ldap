@@ -674,7 +674,12 @@ class Net::LDAP::Connection #:nodoc:
     request    = [old_dn.to_ber, new_rdn.to_ber, delete_attrs.to_ber]
     request   << new_superior.to_ber_contextspecific(0) unless new_superior == nil
 
-    write(request.to_ber_appsequence(Net::LDAP::PDU::ModifyRDNRequest), nil, message_id)
+    controls = args.fetch(:controls, nil)
+    unless controls.nil?
+      controls = controls.to_ber_contextspecific(0)
+    end
+
+    write(request.to_ber_appsequence(Net::LDAP::PDU::ModifyRDNRequest), controls, message_id)
     pdu = queued_read(message_id)
 
     if !pdu || pdu.app_tag != Net::LDAP::PDU::ModifyRDNResponse
@@ -689,9 +694,22 @@ class Net::LDAP::Connection #:nodoc:
   #++
   def delete(args)
     dn = args[:dn] or raise "Unable to delete empty DN"
-    controls   = args.include?(:control_codes) ? args[:control_codes].to_ber_control : nil #use nil so we can compact later
     message_id = next_msgid
     request    = dn.to_s.to_ber_application_string(Net::LDAP::PDU::DeleteRequest)
+
+    # Assemble the optional controls. :control_codes takes the legacy
+    # [[oid, criticality, value?]] form, while :controls takes
+    # BER-encoded control sequences; both are merged into the single
+    # controls element of the request.
+    controls = []
+    if args.include?(:control_codes)
+      control_codes = args[:control_codes]
+      control_codes = [control_codes] unless control_codes.first.is_a?(Array)
+      controls.concat(control_codes.map { |code| code.map(&:to_ber).to_ber_sequence })
+    end
+    controls.concat(Array(args[:controls])) if args[:controls]
+    controls = nil if controls.empty? #use nil so we can compact later
+    controls = controls.to_ber_contextspecific(0) if controls
 
     write(request, controls, message_id)
     pdu = queued_read(message_id)
