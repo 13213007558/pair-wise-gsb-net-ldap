@@ -537,6 +537,17 @@ class Net::LDAP::Connection #:nodoc:
     :replace => 2,
   }
 
+  # Semantic controls supported by the write operations. The Assertion
+  # control is RFC 4528; the read-entry controls (1.3.6.1.1.13.1/2) return
+  # the entry before and/or after the write. Pre-read is not meaningful for
+  # Add because the entry does not exist before the operation.
+  WRITE_CONTROL_SPEC = {
+    :add => [:assertion, :post_read],
+    :delete => [:assertion, :pre_read, :post_read],
+    :modify => [:assertion, :pre_read, :post_read],
+    :modify_rdn => [:assertion, :pre_read, :post_read],
+  }
+
   def self.modify_ops(operations)
     ops = []
     if operations
@@ -546,7 +557,7 @@ class Net::LDAP::Connection #:nodoc:
         op_ber = MODIFY_OPERATIONS[op.to_sym].to_ber_enumerated
         values = [values].flatten.map { |v| v.to_ber if v }.to_ber_set
         values = [attrib.to_s.to_ber, values].to_ber_sequence
-        ops << [op_ber, values].to_ber
+        ops << [op_ber, values].to_ber_sequence
       end
     end
     ops
@@ -569,19 +580,7 @@ class Net::LDAP::Connection #:nodoc:
       ops.to_ber_sequence,
     ].to_ber_appsequence(Net::LDAP::PDU::ModifyRequest)
 
-    controls = args.fetch(:controls, nil)
-    unless controls.nil?
-      controls = controls.to_ber_contextspecific(0)
-    end
-
-    write(request, controls, message_id)
-    pdu = queued_read(message_id)
-
-    if !pdu || pdu.app_tag != Net::LDAP::PDU::ModifyResponse
-      raise Net::LDAP::ResponseMissingOrInvalidError, "response missing or invalid"
-    end
-
-    pdu
+    send_write_request(args, request, Net::LDAP::PDU::ModifyResponse, message_id, :modify)
   end
 
   ##
@@ -646,19 +645,7 @@ class Net::LDAP::Connection #:nodoc:
     message_id = next_msgid
     request    = [add_dn.to_ber, add_attrs.to_ber_sequence].to_ber_appsequence(Net::LDAP::PDU::AddRequest)
 
-    controls = args.fetch(:controls, nil)
-    unless controls.nil?
-      controls = controls.to_ber_contextspecific(0)
-    end
-
-    write(request, controls, message_id)
-    pdu = queued_read(message_id)
-
-    if !pdu || pdu.app_tag != Net::LDAP::PDU::AddResponse
-      raise Net::LDAP::ResponseMissingOrInvalidError, "response missing or invalid"
-    end
-
-    pdu
+    send_write_request(args, request, Net::LDAP::PDU::AddResponse, message_id, :add)
   end
 
   #--
@@ -674,14 +661,8 @@ class Net::LDAP::Connection #:nodoc:
     request    = [old_dn.to_ber, new_rdn.to_ber, delete_attrs.to_ber]
     request   << new_superior.to_ber_contextspecific(0) unless new_superior == nil
 
-    write(request.to_ber_appsequence(Net::LDAP::PDU::ModifyRDNRequest), nil, message_id)
-    pdu = queued_read(message_id)
-
-    if !pdu || pdu.app_tag != Net::LDAP::PDU::ModifyRDNResponse
-      raise Net::LDAP::ResponseMissingOrInvalidError.new "response missing or invalid"
-    end
-
-    pdu
+    request = request.to_ber_appsequence(Net::LDAP::PDU::ModifyRDNRequest)
+    send_write_request(args, request, Net::LDAP::PDU::ModifyRDNResponse, message_id, :modify_rdn)
   end
 
   #--
@@ -689,18 +670,10 @@ class Net::LDAP::Connection #:nodoc:
   #++
   def delete(args)
     dn = args[:dn] or raise "Unable to delete empty DN"
-    controls   = args.include?(:control_codes) ? args[:control_codes].to_ber_control : nil #use nil so we can compact later
     message_id = next_msgid
     request    = dn.to_s.to_ber_application_string(Net::LDAP::PDU::DeleteRequest)
 
-    write(request, controls, message_id)
-    pdu = queued_read(message_id)
-
-    if !pdu || pdu.app_tag != Net::LDAP::PDU::DeleteResponse
-      raise Net::LDAP::ResponseMissingOrInvalidError, "response missing or invalid"
-    end
-
-    pdu
+    send_write_request(args, request, Net::LDAP::PDU::DeleteResponse, message_id, :delete)
   end
 
   def ldapwhoami
@@ -740,6 +713,245 @@ class Net::LDAP::Connection #:nodoc:
   end
 
   private
+
+  # Sends one of the write operations (add/modify/delete/modify_rdn) and
+  # validates the response. The semantic controls (assertion, pre-read and
+  # post-read) are attached to the single write request so that the
+  # condition is evaluated atomically by the server rather than simulated
+  # with a separate search.
+  def send_write_request(args, request, response_tag, message_id, operation)
+    requested = {}
+    controls = build_write_controls(args, operation, requested)
+
+    write(request, controls, message_id)
+    pdu = queued_read(message_id)
+
+    if !pdu || pdu.app_tag != response_tag
+      raise Net::LDAP::ResponseMissingOrInvalidError, "response missing or invalid"
+    end
+
+    pdu.annotate_read_controls(requested)
+    pdu
+  end
+
+  # Returns the BER controls container ([0] Controls) for a write request,
+  # or nil when no controls were supplied.
+  def build_write_controls(args, operation, requested)
+    controls = semantic_write_controls(args, operation, requested)
+    controls.concat(custom_write_controls(args))
+
+    return nil if controls.empty?
+
+    ensure_unique_control_oids(controls)
+    controls.to_ber_contextspecific(0)
+  end
+
+  # Encodes the Assertion and read-entry controls requested directly through
+  # the :assertion, :pre_read and :post_read arguments.
+  def semantic_write_controls(args, operation, requested)
+    supported = WRITE_CONTROL_SPEC.fetch(operation)
+    controls = []
+
+    requested[:pre_read] = false
+    requested[:post_read] = false
+
+    assertion = args[:assertion]
+    if assertion
+      unless supported.include?(:assertion)
+        raise ArgumentError, "assertion control is not supported by #{operation}"
+      end
+      unless assertion.is_a?(Net::LDAP::Filter)
+        raise ArgumentError, "assertion must be a Net::LDAP::Filter"
+      end
+
+      controls << encode_control(Net::LDAP::LDAPControls::ASSERTION, assertion.to_ber)
+    end
+
+    [[:pre_read, Net::LDAP::LDAPControls::PRE_READ],
+     [:post_read, Net::LDAP::LDAPControls::POST_READ]].each do |name, oid|
+      next unless args.key?(name)
+
+      unless supported.include?(name)
+        raise ArgumentError, "#{name} control is not supported by #{operation}"
+      end
+
+      value = args[name]
+      if value.nil? || value == false
+        requested[name] = false
+        next
+      end
+
+      unless read_control_requested?(value)
+        raise ArgumentError, "#{name} must be true, an attribute name, or an array of attribute names"
+      end
+
+      requested[name] = true
+      controls << encode_control(oid, read_entry_control_value(value))
+    end
+
+    controls
+  end
+
+  def read_control_requested?(value)
+    value == true || value.is_a?(Symbol) || value.is_a?(String) ||
+      (value.is_a?(Array) && value.all? { |attribute| attribute.is_a?(Symbol) || attribute.is_a?(String) })
+  end
+
+  # AttributeSelection ::= SEQUENCE OF AttributeDescription
+  #
+  # +true+ requests all user attributes; an empty array requests the empty
+  # attribute selection (no attributes); names request only those
+  # attributes.
+  def read_entry_control_value(value)
+    names = value == true ? [] : Array(value).map(&:to_s)
+    sequence = names.map(&:to_ber).to_ber_sequence
+    [0x04].pack('C') +
+      sequence.bytesize.to_ber_length_encoding +
+      sequence.dup.force_encoding(Encoding::BINARY)
+  end
+
+  # Normalizes controls supplied through the legacy :controls and
+  # :control_codes arguments into individual BER control sequences.
+  def custom_write_controls(args)
+    if args.key?(:controls) && args.key?(:control_codes)
+      raise ArgumentError, "controls and control_codes cannot both be supplied"
+    end
+
+    raw = args.key?(:controls) ? args[:controls] : args[:control_codes]
+    return [] if raw.nil?
+
+    case raw
+    when String
+      normalize_control_container(raw)
+    when Array
+      if raw.empty?
+        []
+      elsif raw.all? { |element| element.is_a?(String) }
+        # Each element is either an individual control sequence (0x30) or a
+        # full controls container (0xa0).
+        raw.flat_map { |element| normalize_control_container(element) }
+      else
+        # Tuples such as [oid, criticality, value] as accepted by
+        # Array#to_ber_control. That helper wraps a single tuple in an
+        # outer sequence; split it back into individual control sequences.
+        tuples = raw.first.is_a?(Array) ? raw : [raw]
+        tuples.map { |control| control.collect(&:to_ber).to_ber_sequence }
+      end
+    else
+      raise ArgumentError, "controls must be BER encoded control sequences"
+    end
+  end
+
+  def normalize_control_container(raw)
+    raise ArgumentError, "expected a BER control sequence" if raw.nil? || raw.empty?
+
+    tag = raw.getbyte(0)
+
+    case tag
+    when 0x30
+      # Either a single Control (whose first element is an OID, tag 0x04)
+      # or a SEQUENCE OF Control produced by Array#to_ber_control (whose
+      # first element is itself a control SEQUENCE, tag 0x30).
+      content = ber_tlv_content(raw)
+      first_tag = content && content.getbyte(0)
+      first_tag == 0x30 ? ber_tlv_slices(content) : [raw]
+    when 0xa0
+      content = ber_tlv_content(raw)
+      raise ArgumentError, "invalid controls container" if content.nil?
+
+      ber_tlv_slices(content)
+    else
+      raise ArgumentError, "expected a BER control sequence or controls container"
+    end
+  end
+
+  # Returns the content bytes of a single BER TLV, or nil if the bytes do
+  # not contain exactly one TLV.
+  def ber_tlv_content(raw)
+    io = StringIO.new(raw)
+    io.getbyte
+    length = read_ber_tlv_length(io)
+    return if length.nil?
+
+    content = io.read(length)
+    trailing = io.read
+    return if content.nil? || content.bytesize != length || (!trailing.nil? && !trailing.empty?)
+
+    content
+  end
+
+  def read_ber_tlv_length(io)
+    first = io.getbyte
+    return if first.nil?
+    return first if first < 0x80
+
+    byte_count = first & 0x7f
+    return if byte_count.zero? || byte_count > 4
+
+    length = 0
+    byte_count.times do
+      byte = io.getbyte
+      return if byte.nil?
+
+      length = (length << 8) | byte
+    end
+    length
+  end
+
+  # Splits the content of a SEQUENCE OF Control into individual, raw BER
+  # control sequences (0x30 ...).
+  def ber_tlv_slices(data)
+    controls = []
+    pos = 0
+
+    while pos < data.bytesize
+      io = StringIO.new(data[pos..])
+      io.getbyte
+      length = read_ber_tlv_length(io)
+      break if length.nil?
+
+      header_size = io.pos
+      slice = data.byteslice(pos, header_size + length)
+      break if slice.nil? || slice.bytesize != header_size + length
+
+      controls << slice
+      pos += slice.bytesize
+    end
+
+    raise ArgumentError, "invalid BER control sequence" unless pos == data.bytesize
+
+    controls
+  end
+
+  # Control ::= SEQUENCE { controlType LDAPOID, criticality BOOLEAN DEFAULT
+  # FALSE, controlValue OCTET STRING OPTIONAL }
+  #
+  # The read-entry and assertion controls are marked critical so that a
+  # server which does not understand them refuses the write rather than
+  # silently ignoring the condition or the requested entries.
+  def encode_control(oid, value)
+    elements = [oid.to_ber, true.to_ber]
+    elements << value if value
+    elements.to_ber_sequence
+  end
+
+  def ensure_unique_control_oids(controls)
+    oids = controls.map { |control| control_oid_from_ber(control) }.compact
+    duplicates = oids.select { |oid| oids.count(oid) > 1 }.uniq
+
+    unless duplicates.empty?
+      raise ArgumentError, "duplicate LDAP controls: #{duplicates.join(", ")}"
+    end
+  end
+
+  def control_oid_from_ber(control)
+    decoded = control.read_ber(Net::LDAP::AsnSyntax)
+    unless decoded.is_a?(Array) && decoded.first.is_a?(String)
+      raise ArgumentError, "invalid BER LDAP control"
+    end
+
+    decoded.first
+  end
 
   # Wrap around Socket.tcp to normalize with other Socket initializers
   class DefaultSocket

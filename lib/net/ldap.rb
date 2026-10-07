@@ -382,6 +382,7 @@ class Net::LDAP
   ResultCodeEntryAlreadyExists           = 68
   ResultCodeObjectClassModsProhibited    = 69
   ResultCodeAffectsMultipleDSAs          = 71
+  ResultCodeAssertionFailed              = 121
   ResultCodeOther                        = 80
 
   # https://tools.ietf.org/html/rfc4511#appendix-A.1
@@ -439,6 +440,7 @@ class Net::LDAP
     ResultCodeEntryAlreadyExists           => "Entry Already Exists",
     ResultCodeObjectClassModsProhibited    => "ObjectClass Modifications Prohibited",
     ResultCodeAffectsMultipleDSAs          => "Affects Multiple DSAs",
+    ResultCodeAssertionFailed              => "Assertion Failed",
     ResultCodeOther                        => "Other",
   }
 
@@ -446,6 +448,9 @@ class Net::LDAP
     PAGED_RESULTS = "1.2.840.113556.1.4.319" # Microsoft evil from RFC 2696
     SORT_REQUEST  = "1.2.840.113556.1.4.473"
     SORT_RESPONSE = "1.2.840.113556.1.4.474"
+    ASSERTION     = "1.3.6.1.1.12" # RFC 4528 (LDAP Assertion)
+    PRE_READ      = "1.3.6.1.1.13.1" # Read-entry controls (pre-read)
+    POST_READ     = "1.3.6.1.1.13.2" # Read-entry controls (post-read)
     DELETE_TREE   = "1.2.840.113556.1.4.805"
   end
 
@@ -671,6 +676,12 @@ class Net::LDAP
     os = OpenStruct.new
     if result.is_a?(Net::LDAP::PDU)
       os.extended_response = result.extended_response
+      os.pre_read_entry = result.pre_read_entry
+      os.post_read_entry = result.post_read_entry
+      os.pre_read_status = result.pre_read_status
+      os.post_read_status = result.post_read_status
+      os.assertion_failed = result.assertion_failed?
+      os.unavailable_critical_extension = result.unavailable_critical_extension?
       result = result.result
     end
     if result.is_a?(Hash)
@@ -1052,6 +1063,30 @@ class Net::LDAP
   # call are not interleaved with other modification-requests received
   # simultaneously by the server. It bears repeating that this concurrency
   # does _not_ imply transactional atomicity, which LDAP does not provide.
+  #
+  # Atomic conditional updates are supported on the single write request
+  # with these optional arguments:
+  #
+  # :assertion :: a Net::LDAP::Filter (RFC 4528). The write proceeds only if
+  #   the filter matches the current entry; otherwise the result code is
+  #   Net::LDAP::ResultCodeAssertionFailed (121).
+  # :pre_read :: +true+ (all user attributes), an attribute name, or an
+  #   Array of names. Returns the entry as it was before the write.
+  # :post_read :: like +:pre_read+, but returns the entry after the write.
+  #   An empty Array requests the empty attribute selection.
+  #
+  # The operation result exposes +pre_read_entry+, +post_read_entry+,
+  # +pre_read_status+ and +post_read_status+ (+:not_requested+,
+  # +:not_provided+ or +:provided+), plus the predicates +assertion_failed+
+  # and +unavailable_critical_extension+. See #get_operation_result.
+  #
+  #   ldap.modify(:dn => dn,
+  #               :operations => [[:replace, :version, '8']],
+  #               :assertion => Net::LDAP::Filter.eq('version', '7'),
+  #               :pre_read => ['version'], :post_read => ['version'])
+  #   result = ldap.get_operation_result
+  #   result.pre_read_entry[:version]   # => ["7"]
+  #   result.post_read_entry[:version]  # => ["8"]
   def modify(args)
     instrument "modify.net_ldap", args do |payload|
       @result = use_connection(args) do |conn|

@@ -75,6 +75,13 @@ class Net::LDAP::PDU
   attr_reader :search_parameters
   attr_reader :bind_parameters
   attr_reader :extended_response
+  attr_reader :pre_read_entry
+  attr_reader :post_read_entry
+  # :not_requested, :not_provided or :provided. These are filled in for
+  # write responses by Connection#send_write_request; other response types
+  # leave them nil.
+  attr_reader :pre_read_status
+  attr_reader :post_read_status
 
   ##
   # Returns RFC-2251 Controls if any.
@@ -169,6 +176,31 @@ class Net::LDAP::PDU
   def result_server_sasl_creds
     @ldap_result && @ldap_result[:serverSaslCreds]
   end
+
+  # RFC 4528: the assertion matched the current entry iff the operation
+  # succeeds; otherwise the server returns result code 121.
+  def assertion_failed?
+    result_code == Net::LDAP::ResultCodeAssertionFailed
+  end
+
+  # A control marked critical that the server does not know gives result
+  # code 12 (unavailableCriticalExtension).
+  def unavailable_critical_extension?
+    result_code == Net::LDAP::ResultCodeUnavailableCriticalExtension
+  end
+
+  # Records whether a pre-/post-read control was sent on the request so the
+  # status can distinguish "not requested" from "server did not return the
+  # control".
+  def annotate_read_controls(requested)
+    @pre_read_status = requested[:pre_read] ? read_status(@pre_read_entry) : :not_requested
+    @post_read_status = requested[:post_read] ? read_status(@post_read_entry) : :not_requested
+  end
+
+  def read_status(entry)
+    entry.nil? ? :not_provided : :provided
+  end
+  private :read_status
 
   def parse_ldap_result(sequence)
     sequence.length >= 3 or raise Net::LDAP::PDU::Error, "Invalid LDAP result length."
@@ -271,10 +303,36 @@ class Net::LDAP::PDU
         o.value = o.criticality
         o.criticality = false
       end
+      parse_read_entry_control(o)
       o
     end
   end
   private :parse_controls
+
+  # The pre-/post-read response controls carry a SearchEntryDNAttributeValue
+  # (the same value as a SearchResultEntry minus the application tag) in the
+  # control's OCTET STRING value.
+  def parse_read_entry_control(control)
+    case control.oid
+    when Net::LDAP::LDAPControls::PRE_READ
+      @pre_read_entry = parse_read_entry(control.value)
+    when Net::LDAP::LDAPControls::POST_READ
+      @post_read_entry = parse_read_entry(control.value)
+    end
+  end
+  private :parse_read_entry_control
+
+  def parse_read_entry(value)
+    entry_data = value.is_a?(String) ? value.read_ber(Net::LDAP::AsnSyntax) : value
+    return unless entry_data.is_a?(Array) && entry_data.length >= 2
+
+    entry = Net::LDAP::Entry.new(entry_data[0])
+    Array(entry_data[1]).each do |attribute, values|
+      entry[attribute] = values
+    end
+    entry
+  end
+  private :parse_read_entry
 
   # (provisional, must document)
   def parse_ldap_search_request(sequence)
